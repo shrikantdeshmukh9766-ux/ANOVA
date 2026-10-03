@@ -1,45 +1,51 @@
 """
-Stream-lite — Baseline Table Builder
-=====================================
-A Streamlit app that turns an uploaded master chart (Excel/CSV) into a
-publication-ready "Table 1": descriptive statistics per variable, with
-automatic parametric/non-parametric test selection.
+Stream-lite — ANOVA Builder
+===========================
+Upload an Excel/CSV master chart, pick a sheet, fix variable types, choose one or
+more outcome (numerical) variables and one or more grouping (categorical)
+variables, and get:
+
+  1. Assumption checks   - Shapiro-Wilk normality per group + Levene (Brown-Forsythe)
+  2. Summary table       - mean ± SD, median (IQR) or both (or chosen from normality),
+                           with test name, test statistic, p-value and effect size
+  3. Post-hoc pairwise   - difference, CI, test statistic and p-value for every pair
 
 Run with:
-    pip install streamlit pandas numpy scipy openpyxl
-    streamlit run streamlite_app.py
+    pip install streamlit pandas numpy scipy openpyxl python-docx
+    streamlit run anova_app.py
 
 How test selection works
--------------------------
-Numeric variables, 2 groups   -> Welch's t-test (parametric) or
-                                  Mann-Whitney U / Wilcoxon rank-sum (non-parametric)
-Numeric variables, 3+ groups  -> One-way ANOVA or Kruskal-Wallis H
-Categorical variables         -> Chi-square test of independence, automatically
-                                  switched to Fisher's exact test for 2x2 tables
-                                  when any expected cell count is below 5
-
-Parametric vs non-parametric is decided automatically via the
-D'Agostino-Pearson omnibus normality test (scipy.stats.normaltest),
-unless the user forces one or the other.
+------------------------
+Parametric      -> One-way ANOVA (equal variances) or Welch's ANOVA (unequal variances)
+                   Post hoc: Tukey HSD, Games-Howell or Bonferroni t-tests
+Non-parametric  -> Kruskal-Wallis H
+                   Post hoc: pairwise Mann-Whitney U (Holm / Bonferroni / BH / none)
+                   with Hodges-Lehmann median difference and CI
+Auto            -> parametric if every group passes Shapiro-Wilk (p > alpha),
+                   otherwise non-parametric. You can force either one.
 """
 
+import html as _html
 import io
+import itertools
+import re
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 from scipy import stats
+from scipy.stats import studentized_range
 from docx import Document
-from docx.shared import Pt
+from docx.enum.section import WD_ORIENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-from openpyxl import Workbook
-from openpyxl.styles import Font as OpenpyxlFont
+from docx.shared import Pt
 
-st.set_page_config(page_title="Stream-lite · Baseline Table Builder", layout="wide")
+st.set_page_config(page_title="Stream-lite · ANOVA Builder", layout="wide")
+
+P_COLS = {"p-value", "p (raw)", "p (adj.)"}
 
 # --------------------------------------------------------------------------
-# Statistical helpers
+# Generic helpers
 # --------------------------------------------------------------------------
 
 def detect_type(series: pd.Series):
@@ -49,8 +55,7 @@ def detect_type(series: pd.Series):
     n = len(non_missing)
     if n == 0:
         return "categorical", 0, 0
-    numeric_coerced = pd.to_numeric(non_missing, errors="coerce")
-    numeric_ratio = numeric_coerced.notna().mean()
+    numeric_ratio = pd.to_numeric(non_missing, errors="coerce").notna().mean()
     unique_n = non_missing.astype(str).str.strip().nunique()
     if numeric_ratio >= 0.9 and unique_n > 10:
         return "numerical", n, unique_n
@@ -58,79 +63,7 @@ def detect_type(series: pd.Series):
 
 
 def effective_type(meta):
-    """Resolve a variable's working type: if the user left it on 'auto',
-    use the auto-detected type; otherwise use their manual override."""
     return meta["detected"] if meta["type"] == "auto" else meta["type"]
-
-
-def is_normal(arr, alpha):
-    """D'Agostino-Pearson omnibus normality test. Needs n>=8; smaller
-    samples are treated as non-normal (safer default)."""
-    arr = np.asarray(arr, dtype=float)
-    arr = arr[~np.isnan(arr)]
-    if len(arr) < 8:
-        return False
-    if np.all(arr == arr[0]):
-        return True
-    try:
-        _, p = stats.normaltest(arr)
-        return p > alpha
-    except Exception:
-        return False
-
-
-def welch_t_test(a, b):
-    a, b = np.asarray(a, float), np.asarray(b, float)
-    res = stats.ttest_ind(a, b, equal_var=False)
-    v1, v2, n1, n2 = a.var(ddof=1), b.var(ddof=1), len(a), len(b)
-    df = (v1 / n1 + v2 / n2) ** 2 / ((v1 / n1) ** 2 / (n1 - 1) + (v2 / n2) ** 2 / (n2 - 1))
-    return {"name": "Independent t-test (Welch)",
-            "stat": f"t={res.statistic:.2f}, df={df:.1f}",
-            "p": float(res.pvalue)}
-
-
-def mann_whitney_test(a, b):
-    res = stats.mannwhitneyu(a, b, alternative="two-sided")
-    return {"name": "Mann-Whitney U (Wilcoxon rank-sum)",
-            "stat": f"U={res.statistic:.1f}",
-            "p": float(res.pvalue)}
-
-
-def anova_test(groups):
-    res = stats.f_oneway(*groups)
-    k = len(groups)
-    N = sum(len(g) for g in groups)
-    return {"name": "One-way ANOVA",
-            "stat": f"F={res.statistic:.2f}, df={k-1},{N-k}",
-            "p": float(res.pvalue)}
-
-
-def kruskal_test(groups):
-    res = stats.kruskal(*groups)
-    return {"name": "Kruskal-Wallis H",
-            "stat": f"H={res.statistic:.2f}, df={len(groups)-1}",
-            "p": float(res.pvalue)}
-
-
-def chi_or_fisher_test(table, yates_correction=False):
-    """RxC contingency table -> chi-square, auto-falling back to Fisher's
-    exact test for 2x2 tables with low expected counts.
-    yates_correction controls scipy's Yates' continuity correction, which
-    only has an effect on 2x2 tables (scipy silently ignores it otherwise).
-    Off by default, since the correction is conservative and not universally
-    recommended; many modern guidelines prefer the uncorrected chi-square or
-    Fisher's exact test for small 2x2 tables instead."""
-    table = np.array(table)
-    chi2, p, dof, expected = stats.chi2_contingency(table, correction=yates_correction)
-    min_e = float(expected.min())
-    if table.shape == (2, 2) and min_e < 5:
-        _, p_fisher = stats.fisher_exact(table)
-        return {"name": "Fisher's exact test", "stat": "—", "p": float(p_fisher), "min_expected": min_e}
-    name = "Chi-square test"
-    if table.shape == (2, 2) and yates_correction:
-        name = "Chi-square test (Yates-corrected)"
-    return {"name": name, "stat": f"\u03C7\u00B2={chi2:.2f}, df={dof}",
-            "p": float(p), "min_expected": min_e}
 
 
 def fmt_p(p):
@@ -139,468 +72,393 @@ def fmt_p(p):
     return "<0.001" if p < 0.001 else f"{p:.3f}"
 
 
-def fmt_num(x, d=3):
+def fmt_num(x, d=2):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "—"
     return f"{x:.{d}f}"
 
 
+def is_sig(s, alpha):
+    s = str(s)
+    if s.startswith("<"):
+        return True
+    try:
+        return float(s) < alpha
+    except ValueError:
+        return False
+
+
+def padjust(p, method):
+    p = np.asarray(p, float)
+    m = len(p)
+    if method == "none" or m <= 1:
+        return p.copy()
+    if method == "bonferroni":
+        return np.minimum(1, p * m)
+    order = np.argsort(p)
+    adj = np.empty(m)
+    if method == "holm":
+        running = 0.0
+        for rank, i in enumerate(order):
+            running = max(running, (m - rank) * p[i])
+            adj[i] = min(1.0, running)
+        return adj
+    if method == "bh":
+        running = 1.0
+        for rank in range(m - 1, -1, -1):
+            i = order[rank]
+            running = min(running, p[i] * m / (rank + 1))
+            adj[i] = running
+        return adj
+    raise ValueError(method)
+
+
 # --------------------------------------------------------------------------
-# Table 1 builder
+# Assumption checks
 # --------------------------------------------------------------------------
 
-def format_numeric_cell(values, display_mode, use_param):
-    """Format one group's numeric summary according to the chosen display mode.
-    display_mode: 'auto' | 'mean_sd' | 'median_iqr' | 'both'"""
-    if len(values) == 0:
-        return "—"
-    show_mean = display_mode == "mean_sd" or display_mode == "both" or (display_mode == "auto" and use_param)
-    show_median = display_mode == "median_iqr" or display_mode == "both" or (display_mode == "auto" and not use_param)
+def normality_test(arr):
+    """Shapiro-Wilk (n<=5000) or D'Agostino-Pearson (n>5000). Returns (stat, p)
+    or (None, None) when it cannot be computed (n<3 or constant data)."""
+    arr = np.asarray(arr, float)
+    if len(arr) < 3 or np.ptp(arr) == 0:
+        return None, None
+    try:
+        if len(arr) > 5000:
+            s, p = stats.normaltest(arr)
+        else:
+            s, p = stats.shapiro(arr)
+        return float(s), float(p)
+    except Exception:
+        return None, None
+
+
+# --------------------------------------------------------------------------
+# Omnibus tests
+# --------------------------------------------------------------------------
+
+def eta_squared(groups):
+    allv = np.concatenate(groups)
+    gm = allv.mean()
+    ssb = sum(len(g) * (g.mean() - gm) ** 2 for g in groups)
+    sst = ((allv - gm) ** 2).sum()
+    return float(ssb / sst) if sst > 0 else np.nan
+
+
+def classic_anova(groups):
+    res = stats.f_oneway(*groups)
+    k, N = len(groups), sum(len(g) for g in groups)
+    return {"name": "One-way ANOVA", "stat": f"F={res.statistic:.2f}, df={k-1},{N-k}",
+            "p": float(res.pvalue), "effect": f"\u03B7\u00B2={eta_squared(groups):.3f}"}
+
+
+def welch_anova(groups):
+    k = len(groups)
+    n = np.array([len(g) for g in groups], float)
+    m = np.array([g.mean() for g in groups])
+    v = np.array([g.var(ddof=1) for g in groups])
+    w = n / v
+    W = w.sum()
+    mw = (w * m).sum() / W
+    a = (w * (m - mw) ** 2).sum() / (k - 1)
+    t = (((1 - w / W) ** 2) / (n - 1)).sum()
+    b = 1 + 2 * (k - 2) / (k ** 2 - 1) * t
+    F = a / b
+    df2 = (k ** 2 - 1) / (3 * t)
+    p = float(stats.f.sf(F, k - 1, df2))
+    return {"name": "Welch's ANOVA", "stat": f"F={F:.2f}, df={k-1},{df2:.1f}",
+            "p": p, "effect": f"\u03B7\u00B2={eta_squared(groups):.3f}"}
+
+
+def kruskal(groups):
+    res = stats.kruskal(*groups)
+    N = sum(len(g) for g in groups)
+    eps = res.statistic / (N - 1) if N > 1 else np.nan
+    return {"name": "Kruskal\u2013Wallis H", "stat": f"H={res.statistic:.2f}, df={len(groups)-1}",
+            "p": float(res.pvalue), "effect": f"\u03B5\u00B2={eps:.3f}"}
+
+
+# --------------------------------------------------------------------------
+# Post-hoc tests
+# --------------------------------------------------------------------------
+
+def posthoc_parametric(names, groups, method, alpha, d):
+    """method: 'tukey' | 'gameshowell' | 'bonferroni'. Returns list of row dicts."""
+    k = len(groups)
+    n = np.array([len(g) for g in groups], float)
+    m = np.array([g.mean() for g in groups])
+    v = np.array([g.var(ddof=1) for g in groups])
+    N = n.sum()
+    dfw = N - k
+    mse = ((n - 1) * v).sum() / dfw
+    pairs = list(itertools.combinations(range(k), 2))
+    npairs = len(pairs)
+    rows = []
+    for i, j in pairs:
+        diff = m[i] - m[j]
+        if method == "tukey":
+            se = np.sqrt(mse / 2 * (1 / n[i] + 1 / n[j]))
+            q = abs(diff) / se if se > 0 else np.nan
+            p = float(studentized_range.sf(q, k, dfw))
+            crit = studentized_range.ppf(1 - alpha, k, dfw)
+            lo, hi = diff - crit * se, diff + crit * se
+            stat = f"q={q:.2f}, df={dfw:.0f}"
+            label = "Tukey HSD"
+        elif method == "gameshowell":
+            s2 = v[i] / n[i] + v[j] / n[j]
+            se = np.sqrt(s2 / 2)
+            df = s2 ** 2 / ((v[i] / n[i]) ** 2 / (n[i] - 1) + (v[j] / n[j]) ** 2 / (n[j] - 1))
+            q = abs(diff) / se if se > 0 else np.nan
+            p = float(studentized_range.sf(q, k, df))
+            crit = studentized_range.ppf(1 - alpha, k, df)
+            lo, hi = diff - crit * se, diff + crit * se
+            stat = f"q={q:.2f}, df={df:.1f}"
+            label = "Games-Howell"
+        else:  # bonferroni pooled-variance t-tests
+            se = np.sqrt(mse * (1 / n[i] + 1 / n[j]))
+            t = diff / se if se > 0 else np.nan
+            p_raw = 2 * stats.t.sf(abs(t), dfw)
+            p = float(min(1.0, p_raw * npairs))
+            crit = stats.t.ppf(1 - alpha / (2 * npairs), dfw)
+            lo, hi = diff - crit * se, diff + crit * se
+            stat = f"t={t:.2f}, df={dfw:.0f}"
+            label = "Bonferroni t-test"
+        rows.append({"Comparison": f"{names[i]} \u2212 {names[j]}", "Method": label,
+                     "Difference": fmt_num(diff, d), "CI": f"{fmt_num(lo, d)} to {fmt_num(hi, d)}",
+                     "Statistic": stat, "p (raw)": "—", "p (adj.)": fmt_p(p), "_p": p})
+    return rows
+
+
+def hodges_lehmann(a, b, alpha):
+    """Median of all pairwise differences a-b with a distribution-free CI
+    (normal approximation to the Mann-Whitney U distribution)."""
+    diffs = np.sort((a[:, None] - b[None, :]).ravel())
+    n1n2 = len(diffs)
+    est = float(np.median(diffs))
+    z = stats.norm.ppf(1 - alpha / 2)
+    c = n1n2 / 2 - z * np.sqrt(n1n2 * (len(a) + len(b) + 1) / 12)
+    c = int(np.floor(c))
+    lo = diffs[max(c, 0)]
+    hi = diffs[min(n1n2 - 1 - c, n1n2 - 1)] if c >= 0 else diffs[-1]
+    return est, float(lo), float(hi)
+
+
+def posthoc_nonparametric(names, groups, padj, alpha, d):
+    k = len(groups)
+    pairs = list(itertools.combinations(range(k), 2))
+    npairs = len(pairs)
+    # CI is Bonferroni-widened whenever a familywise correction (Holm/Bonferroni) is chosen
+    ci_alpha = alpha / npairs if padj in ("bonferroni", "holm") else alpha
+    raw, parts = [], []
+    for i, j in pairs:
+        a, b = groups[i], groups[j]
+        res = stats.mannwhitneyu(a, b, alternative="two-sided")
+        est, lo, hi = hodges_lehmann(a, b, ci_alpha)
+        raw.append(float(res.pvalue))
+        parts.append((i, j, res.statistic, est, lo, hi))
+    adj = padjust(raw, padj)
+    label = {"holm": "Mann-Whitney (Holm)", "bonferroni": "Mann-Whitney (Bonferroni)",
+             "bh": "Mann-Whitney (BH)", "none": "Mann-Whitney (unadjusted)"}[padj]
+    rows = []
+    for (i, j, U, est, lo, hi), pr, pa in zip(parts, raw, adj):
+        rows.append({"Comparison": f"{names[i]} \u2212 {names[j]}", "Method": label,
+                     "Difference": fmt_num(est, d), "CI": f"{fmt_num(lo, d)} to {fmt_num(hi, d)}",
+                     "Statistic": f"U={U:.1f}", "p (raw)": fmt_p(pr),
+                     "p (adj.)": fmt_p(float(pa)), "_p": float(pa)})
+    return rows
+
+
+# --------------------------------------------------------------------------
+# Per outcome x grouping analysis
+# --------------------------------------------------------------------------
+
+def get_groups(df, outcome, gcol):
+    sub = pd.DataFrame({
+        "y": pd.to_numeric(df[outcome], errors="coerce"),
+        "g": df[gcol].astype(str).str.strip(),
+    })
+    sub = sub.dropna()
+    sub = sub[~sub["g"].isin(["", "nan", "NaN", "None"])]
+    out = {}
+    dropped = []
+    for lvl, grp in sub.groupby("g"):
+        if len(grp) >= 2:
+            out[lvl] = grp["y"].to_numpy(float)
+        else:
+            dropped.append(lvl)
+    return out, dropped
+
+
+def summary_cell(values, mode, use_param, d):
     parts = []
-    if show_mean:
-        parts.append(f"{fmt_num(np.mean(values))} \u00B1 {fmt_num(np.std(values, ddof=1))}")
-    if show_median:
+    if mode in ("mean_sd", "both") or (mode == "auto" and use_param):
+        parts.append(f"{fmt_num(np.mean(values), d)} \u00B1 {fmt_num(np.std(values, ddof=1), d)}")
+    if mode in ("median_iqr", "both") or (mode == "auto" and not use_param):
         q1, med, q3 = np.percentile(values, [25, 50, 75])
-        parts.append(f"{fmt_num(med)} ({fmt_num(q1)}\u2013{fmt_num(q3)})")
+        parts.append(f"{fmt_num(med, d)} ({fmt_num(q1, d)}\u2013{fmt_num(q3, d)})")
     return "; ".join(parts)
 
 
-def numeric_label(col, display_mode, use_param):
-    if display_mode == "mean_sd":
+def outcome_label(col, mode, use_param):
+    if mode == "mean_sd" or (mode == "auto" and use_param):
         return f"{col}, mean \u00B1 SD"
-    if display_mode == "median_iqr":
+    if mode == "median_iqr" or (mode == "auto" and not use_param):
         return f"{col}, median (IQR)"
-    if display_mode == "both":
-        return f"{col}, mean \u00B1 SD; median (IQR)"
-    return f"{col}, mean \u00B1 SD" if use_param else f"{col}, median (IQR)"
+    return f"{col}, mean \u00B1 SD; median (IQR)"
 
 
-def build_table1(df, var_meta, group_col, test_mode, alpha, display_mode="auto",
-                  pct_mode="column", pct_digits=2, yates_correction=False):
-    """Returns (display_rows, csv_rows, footnote_flags).
-    display_rows: list of dicts describing each printed row for st rendering.
-    csv_rows: list of lists for CSV / clipboard export.
-    display_mode controls how numeric summaries are shown: 'auto' (mean±SD if
-    normal else median (IQR)), 'mean_sd', 'median_iqr', or 'both'. This is
-    independent of test_mode, which controls whether t-test/ANOVA or
-    Wilcoxon/Kruskal-Wallis is used for the comparison.
-    pct_mode controls the denominator used for categorical n (%) cells when a
-    grouping variable is set: 'column' (default) expresses each cell as a
-    percentage of its own group's total (columns sum to ~100%); 'row'
-    expresses each cell as a percentage of that category's total across all
-    groups (rows sum to ~100%). Ignored when there is no grouping variable
-    (percentages are always of the overall n in that case).
-    pct_digits controls the number of decimal places shown for all
-    categorical percentages.
-    yates_correction controls whether Yates' continuity correction is applied
-    to the chi-square test for 2x2 tables. Off by default. Has no effect on
-    Fisher's exact test or on chi-square tables larger than 2x2.
-    """
-    group_levels = []
-    if group_col:
-        group_levels = sorted(df[group_col].dropna().astype(str).str.strip().unique().tolist())
+def analyze(df, outcome, gcol, cfg):
+    """Returns dict(summary_cells, test, assumptions, posthoc, use_param, msg) or None + message."""
+    alpha, d = cfg["alpha"], cfg["decimals"]
+    groups, dropped = get_groups(df, outcome, gcol)
+    if len(groups) < 2:
+        return None, f"{outcome} by {gcol}: fewer than 2 groups with n\u22652 \u2014 skipped."
+    names = sorted(groups)
+    arrs = [groups[nm] for nm in names]
+    k = len(arrs)
 
-    header = ["Variable"]
-    if group_col:
-        for lv in group_levels:
-            n = (df[group_col].astype(str).str.strip() == lv).sum()
-            header.append(f"{lv} (n={n})")
-        header += ["Test", "Statistic", "p"]
+    assumptions, normal_flags = [], []
+    for nm, a in zip(names, arrs):
+        W, p = normality_test(a)
+        ok = (p is not None) and p > alpha
+        normal_flags.append(ok)
+        assumptions.append({
+            "Outcome": outcome, "Check": "Normality (Shapiro-Wilk)" if len(a) <= 5000 else "Normality (D'Agostino-Pearson)",
+            "Group": nm, "n": len(a), "Statistic": "—" if W is None else f"{W:.3f}",
+            "p-value": fmt_p(p), "Result": "Normal" if ok else ("Not normal" if p is not None else "n/a (n<3 or constant)"),
+        })
+    try:
+        lev_stat, lev_p = stats.levene(*arrs, center="median")
+        lev_p = float(lev_p)
+        eq_var = lev_p > alpha
+        assumptions.append({
+            "Outcome": outcome, "Check": "Equal variances (Levene, median-centred)", "Group": "All groups",
+            "n": sum(len(a) for a in arrs), "Statistic": f"W={lev_stat:.3f}", "p-value": fmt_p(lev_p),
+            "Result": "Equal" if eq_var else "Unequal",
+        })
+    except Exception:
+        lev_p, eq_var = np.nan, True
+
+    if cfg["test_mode"] == "parametric":
+        use_param = True
+    elif cfg["test_mode"] == "nonparametric":
+        use_param = False
     else:
-        header.append(f"Overall (n={len(df)})")
+        use_param = all(normal_flags)
 
-    csv_rows = [header]
-    display_rows = []
-    flags = set()
-
-    variables = [c for c in df.columns if var_meta[c]["use"] and c != group_col]
-
-    for col in variables:
-        vtype = effective_type(var_meta[col])
-
-        if vtype == "numerical":
-            numeric_series = pd.to_numeric(df[col], errors="coerce")
-
-            if group_col:
-                group_arrays = []
-                for lv in group_levels:
-                    mask = (df[group_col].astype(str).str.strip() == lv) & numeric_series.notna()
-                    group_arrays.append(numeric_series[mask].values)
-            else:
-                group_arrays = None
-
-            all_vals = numeric_series.dropna().values
-
-            # use_param governs which TEST is used (t-test/ANOVA vs Wilcoxon/KW);
-            # it is decided by test_mode regardless of the display_mode setting.
-            if test_mode == "parametric":
-                use_param = True
-            elif test_mode == "nonparametric":
-                use_param = False
-            else:
-                if group_col:
-                    use_param = all(is_normal(g, alpha) for g in group_arrays if len(g) > 0)
-                else:
-                    use_param = is_normal(all_vals, alpha)
-
-            label = numeric_label(col, display_mode, use_param)
-
-            cells = []
-            if group_col:
-                for g in group_arrays:
-                    cells.append(format_numeric_cell(g, display_mode, use_param))
-            else:
-                cells.append(format_numeric_cell(all_vals, display_mode, use_param))
-
-            test_result = None
-            if group_col and len(group_levels) >= 2:
-                nonempty = [g for g in group_arrays if len(g) > 1]  # need >=2 points per group for variance
-                if len(nonempty) >= 2:
-                    try:
-                        if len(group_levels) == 2:
-                            test_result = welch_t_test(*nonempty) if use_param else mann_whitney_test(*nonempty)
-                        else:
-                            test_result = anova_test(nonempty) if use_param else kruskal_test(nonempty)
-                    except Exception:
-                        test_result = None
-                        flags.add("skipped")
-
-            display_rows.append({"kind": "var", "label": label, "cells": cells, "test": test_result})
-            csv_rows.append([label, *cells,
-                              test_result["name"] if test_result else "",
-                              test_result["stat"] if test_result else "",
-                              fmt_p(test_result["p"]) if test_result else ""])
-
-        else:  # categorical
-            series = df[col].astype(str).str.strip()
-            series = series.where(df[col].notna() & (series != ""), other=np.nan)
-            levels = sorted(series.dropna().unique().tolist())
-
-            contingency = None
-            test_result = None
-            if group_col and len(group_levels) >= 2 and len(levels) >= 2:
-                group_series = df[group_col].astype(str).str.strip()
-                contingency = [[int(((series == lv) & (group_series == glv)).sum()) for glv in group_levels]
-                               for lv in levels]
-                # Skip the test if any row/column is entirely zero — chi2_contingency
-                # (and Fisher's exact) require every row and column to have at least
-                # one observation, otherwise the table is degenerate.
-                arr = np.array(contingency)
-                if arr.size > 0 and arr.shape[0] >= 2 and arr.shape[1] >= 2 \
-                        and (arr.sum(axis=0) > 0).all() and (arr.sum(axis=1) > 0).all():
-                    try:
-                        res = chi_or_fisher_test(contingency, yates_correction=yates_correction)
-                        test_result = res
-                        if res["name"].startswith("Fisher"):
-                            flags.add("fisher")
-                        else:
-                            flags.add("chi2")
-                            if res["min_expected"] < 5:
-                                flags.add("lowE")
-                    except Exception:
-                        test_result = None
-                        flags.add("skipped")
-            elif group_col:
-                # Build a zero contingency table skeleton for the n(%) display below,
-                # even though no test is run (fewer than 2 non-empty levels/groups).
-                group_series = df[group_col].astype(str).str.strip()
-                contingency = [[int(((series == lv) & (group_series == glv)).sum()) for glv in group_levels]
-                               for lv in levels]
-
-            display_rows.append({"kind": "varheader", "label": f"{col}, n (%)"})
-            csv_rows.append([f"{col}, n (%)"])
-            flags.add("catpct")
-
-            # Non-missing total for this variable, overall and per group. Used
-            # as the % denominator so missing values are excluded (rather than
-            # counting them against the group/overall total), giving true
-            # "percent of observed" values.
-            total_nonmissing = int(series.notna().sum())
-            group_nonmissing_totals = None
-            if group_col and levels:
-                group_nonmissing_totals = [sum(contingency[i][gi] for i in range(len(levels)))
-                                            for gi in range(len(group_levels))]
-
-            for i, lv in enumerate(levels):
-                cells = []
-                if group_col:
-                    row_total = sum(contingency[i]) if pct_mode == "row" else None
-                    for gi, glv in enumerate(group_levels):
-                        n = contingency[i][gi]
-                        if pct_mode == "row":
-                            denom = row_total
-                        else:
-                            denom = group_nonmissing_totals[gi]
-                        pct = 100 * n / denom if denom else 0.0
-                        cells.append(f"{n} ({pct:.{pct_digits}f}%)")
-                else:
-                    n = int((series == lv).sum())
-                    pct = 100 * n / total_nonmissing if total_nonmissing else 0.0
-                    cells.append(f"{n} ({pct:.{pct_digits}f}%)")
-
-                is_last = i == len(levels) - 1
-                display_rows.append({"kind": "level", "label": lv, "cells": cells,
-                                      "test": test_result if is_last else None})
-                csv_rows.append([f"  {lv}", *cells,
-                                  test_result["name"] if is_last and test_result else "",
-                                  test_result["stat"] if is_last and test_result else "",
-                                  fmt_p(test_result["p"]) if is_last and test_result else ""])
-
-    return header, display_rows, csv_rows, flags
-
-
-def render_table_markdown(header, display_rows, group_col, alpha):
-    """Render the Table 1 as an HTML table with a three-line (journal-style) look."""
-    css = """
-    <style>
-    table.pub { width:100%; border-collapse:collapse; font-family: Calibri, Candara, Segoe, "Segoe UI", Optima, Arial, sans-serif; font-size: 9pt; }
-    table.pub thead th { border-top:2px solid #1E2A32; border-bottom:1px solid #1E2A32;
-                          padding:8px 10px; text-align:left; font-family: inherit; }
-    table.pub tbody td { padding:5px 10px; }
-    table.pub tbody tr.var td { font-weight:700; padding-top:10px; }
-    table.pub tbody tr.level td.name { padding-left:20px; color:#555; font-weight:400; }
-    table.pub td.stat { font-family: inherit; text-align:center; font-size:9pt;}
-    table.pub td.sig { font-weight:700; }
-    table.pub tbody tr.lastrow td { border-bottom:2px solid #1E2A32; padding-bottom:10px; }
-    </style>
-    """
-    html = css + '<table class="pub"><thead><tr>'
-    for h in header:
-        html += f"<th>{h}</th>"
-    html += "</tr></thead><tbody>"
-
-    for idx, row in enumerate(display_rows):
-        is_last_of_block = (idx == len(display_rows) - 1) or \
-                            (display_rows[idx + 1]["kind"] in ("var", "varheader"))
-        cls = "var" if row["kind"] in ("var", "varheader") else "level"
-        cls += " lastrow" if is_last_of_block else ""
-        html += f'<tr class="{cls}">'
-
-        if row["kind"] == "varheader":
-            html += f'<td>{row["label"]}</td>'
-            colspan = len(header) - 1
-            html += f'<td colspan="{colspan}"></td>'
+    try:
+        if use_param:
+            welch = cfg["variance"] == "welch" or (cfg["variance"] == "auto" and not eq_var)
+            if welch and min(a.var(ddof=1) for a in arrs) == 0:
+                welch = False  # Welch needs non-zero variance in every group
+            test = welch_anova(arrs) if welch else classic_anova(arrs)
         else:
-            name_cls = "name" if row["kind"] == "level" else ""
-            html += f'<td class="{name_cls}">{row["label"]}</td>'
-            for c in row["cells"]:
-                html += f'<td class="stat">{c}</td>'
-            if group_col:
-                t = row.get("test")
-                if t:
-                    sig = "sig" if t["p"] < alpha else ""
-                    html += f'<td>{t["name"]}</td><td class="stat">{t["stat"]}</td><td class="stat {sig}">{fmt_p(t["p"])}</td>'
-                else:
-                    html += "<td>—</td><td>—</td><td>—</td>"
-        html += "</tr>"
-    html += "</tbody></table>"
-    return html
+            welch = False
+            test = kruskal(arrs)
+    except Exception as e:
+        return None, f"{outcome} by {gcol}: test could not be computed ({e})."
+
+    posthoc = []
+    if k >= 3 and (not cfg["posthoc_only_sig"] or test["p"] < alpha):
+        try:
+            if use_param:
+                m = cfg["posthoc_param"]
+                if m == "auto":
+                    m = "gameshowell" if welch else "tukey"
+                posthoc = posthoc_parametric(names, arrs, m, alpha, d)
+            else:
+                posthoc = posthoc_nonparametric(names, arrs, cfg["posthoc_np"], alpha, d)
+        except Exception as e:
+            return None, f"{outcome} by {gcol}: post-hoc failed ({e})."
+        for r in posthoc:
+            r["Outcome"] = outcome
+
+    cells = {nm: summary_cell(a, cfg["display"], use_param, d) for nm, a in zip(names, arrs)}
+    notes = []
+    if dropped:
+        notes.append(f"{outcome} by {gcol}: groups with n<2 excluded ({', '.join(dropped)}).")
+    return {"cells": cells, "test": test, "assumptions": assumptions, "posthoc": posthoc,
+            "use_param": use_param, "k": k, "label": outcome_label(outcome, cfg["display"], use_param)}, notes
 
 
-def _set_cell_border(cell, **kwargs):
-    """Add borders to a single table cell. kwargs like
-    top={'sz':12,'val':'single','color':'000000'}."""
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    tcBorders = tcPr.find(qn('w:tcBorders'))
-    if tcBorders is None:
-        tcBorders = OxmlElement('w:tcBorders')
-        tcPr.append(tcBorders)
-    for edge in ('top', 'left', 'bottom', 'right'):
-        if edge in kwargs:
-            spec = kwargs[edge]
-            tag = f'w:{edge}'
-            el = tcBorders.find(qn(tag))
-            if el is None:
-                el = OxmlElement(tag)
-                tcBorders.append(el)
-            el.set(qn('w:val'), spec.get('val', 'single'))
-            el.set(qn('w:sz'), str(spec.get('sz', 8)))
-            el.set(qn('w:color'), spec.get('color', '000000'))
+# --------------------------------------------------------------------------
+# Rendering / export
+# --------------------------------------------------------------------------
+
+def render_html(df, alpha):
+    css = ("<style>.sl-t{border-collapse:collapse;width:100%;font-size:0.9rem;"
+           "border-top:2px solid currentColor;border-bottom:2px solid currentColor}"
+           ".sl-t th{border-bottom:1px solid currentColor;text-align:left;padding:4px 8px}"
+           ".sl-t td{padding:4px 8px}</style>")
+    head = "".join(f"<th>{_html.escape(str(c))}</th>" for c in df.columns)
+    body = ""
+    for _, row in df.iterrows():
+        tds = ""
+        for c in df.columns:
+            v = _html.escape(str(row[c]))
+            if c in P_COLS and is_sig(row[c], alpha):
+                v = f"<b>{v}</b>"
+            tds += f"<td>{v}</td>"
+        body += f"<tr>{tds}</tr>"
+    return f"{css}<table class='sl-t'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
 
-def _set_run_font(run, name="Calibri", size=9, bold=None, italic=None):
-    run.font.name = name
-    run.font.size = Pt(size)
-    # Ensure the font also applies to complex-script/east-asian text runs in Word
-    rPr = run._element.get_or_add_rPr()
-    rFonts = rPr.find(qn('w:rFonts'))
-    if rFonts is None:
-        rFonts = OxmlElement('w:rFonts')
-        rPr.append(rFonts)
-    rFonts.set(qn('w:ascii'), name)
-    rFonts.set(qn('w:hAnsi'), name)
-    rFonts.set(qn('w:cs'), name)
-    if bold is not None:
-        run.font.bold = bold
-    if italic is not None:
-        run.font.italic = italic
-
-
-def descriptive_footnote(display_mode, alpha):
-    if display_mode == "mean_sd":
-        return "Continuous variables reported as mean \u00B1 SD; categorical variables reported as n (%)."
-    if display_mode == "median_iqr":
-        return "Continuous variables reported as median (IQR); categorical variables reported as n (%)."
-    if display_mode == "both":
-        return "Continuous variables reported as mean \u00B1 SD and median (IQR); categorical variables reported as n (%)."
-    return (f"Continuous variables reported as mean \u00B1 SD (assessed as normal via D'Agostino-Pearson "
-            f"test, \u03B1={alpha}) or median (IQR) otherwise; categorical variables reported as n (%).")
-
-
-def pct_basis_footnote(group_col, pct_mode):
-    """Explain the denominator used for categorical n (%) cells."""
-    if not group_col:
-        return None
-    if pct_mode == "row":
-        return ("Percentages for categorical variables are row-wise: each n (%) is a share of that "
-                "category's total across all groups (rows sum to ~100%).")
-    return ("Percentages for categorical variables are column-wise: each n (%) is a share of its own "
-            "group's total (columns sum to ~100%).")
-
-
-def build_excel(csv_rows, sheet_name="Table 1"):
-    """Build an .xlsx file directly with openpyxl (bypassing pandas'
-    ExcelWriter/openpyxl sheet-swap, which on some pandas/openpyxl/Python
-    version combinations raises 'IndexError: At least one sheet must be
-    visible'). csv_rows is the same list-of-lists used for the CSV export,
-    with csv_rows[0] as the header row."""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = sheet_name
-    ws.sheet_state = "visible"
-
-    for row in csv_rows:
-        ws.append(row)
-
-    for xl_row in ws.iter_rows():
-        for cell in xl_row:
-            bold = cell.row == 1
-            cell.font = OpenpyxlFont(name="Calibri", size=9, bold=bold)
-
-    for column_cells in ws.columns:
-        length = max((len(str(c.value)) if c.value is not None else 0) for c in column_cells)
-        ws.column_dimensions[column_cells[0].column_letter].width = min(max(length + 2, 10), 45)
-
+def build_excel(results):
     buf = io.BytesIO()
-    wb.save(buf)
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        for i, (g, r) in enumerate(results.items(), 1):
+            tag = re.sub(r"[\[\]:*?/\\]", "_", g)[:22]
+            r["summary"].to_excel(xw, sheet_name=f"S{i}_{tag}"[:31], index=False)
+            r["assumptions"].to_excel(xw, sheet_name=f"A{i}_{tag}"[:31], index=False)
+            if not r["posthoc"].empty:
+                r["posthoc"].to_excel(xw, sheet_name=f"P{i}_{tag}"[:31], index=False)
     buf.seek(0)
     return buf.getvalue()
 
 
-def build_docx(header, display_rows, group_col, alpha, flags, display_mode="auto",
-                pct_mode="column", yates_correction=False, title="Table 1. Baseline characteristics"):
-    """Build a Word document with a three-line (journal-style) table.
-    All table and footnote text uses Calibri 9pt."""
-    doc = Document()
-
-    # Set the document default (Normal style) to Calibri 9pt so anything
-    # not explicitly styled below still matches.
-    normal = doc.styles["Normal"]
-    normal.font.name = "Calibri"
-    normal.font.size = Pt(9)
-
-    h = doc.add_heading(title, level=2)
-    for r in h.runs:
-        _set_run_font(r, size=11, bold=True)
-
-    ncols = len(header)
-    table = doc.add_table(rows=1, cols=ncols)
-    table.autofit = True
-
-    hdr_cells = table.rows[0].cells
-    for i, htext in enumerate(header):
-        hdr_cells[i].text = str(htext)
-        for p in hdr_cells[i].paragraphs:
-            for run in p.runs:
-                _set_run_font(run, size=9, bold=True)
-        _set_cell_border(hdr_cells[i], top={'sz': 12, 'val': 'single'},
-                          bottom={'sz': 8, 'val': 'single'})
-
-    n_rows = len(display_rows)
-    for idx, row in enumerate(display_rows):
-        cells = table.add_row().cells
-        is_last = idx == n_rows - 1
-        next_is_new_block = is_last or (display_rows[idx + 1]["kind"] in ("var", "varheader"))
-
-        if row["kind"] == "varheader":
-            cells[0].text = row["label"]
-            for run in cells[0].paragraphs[0].runs:
-                _set_run_font(run, size=9, bold=True)
-            for c in cells[1:]:
-                c.text = ""
-        else:
-            label = ("    " + row["label"]) if row["kind"] == "level" else row["label"]
-            cells[0].text = label
-            for run in cells[0].paragraphs[0].runs:
-                _set_run_font(run, size=9, bold=(row["kind"] == "var"))
-            ci = 1
-            for val in row["cells"]:
-                cells[ci].text = str(val)
-                for p in cells[ci].paragraphs:
+def _docx_table(doc, df, alpha):
+    t = doc.add_table(rows=1, cols=len(df.columns))
+    t.style = "Table Grid"
+    for i, c in enumerate(df.columns):
+        t.rows[0].cells[i].text = str(c)
+        for run in t.rows[0].cells[i].paragraphs[0].runs:
+            run.bold = True
+            run.font.size = Pt(8)
+    for _, row in df.iterrows():
+        cells = t.add_row().cells
+        for i, c in enumerate(df.columns):
+            cells[i].text = str(row[c])
+            for p in cells[i].paragraphs:
+                if i > 0:
                     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    for run in p.runs:
-                        _set_run_font(run, size=9)
-                ci += 1
-            if group_col:
-                t = row.get("test")
-                if t:
-                    cells[ci].text = t["name"]
-                    for run in cells[ci].paragraphs[0].runs:
-                        _set_run_font(run, size=9)
-                    ci += 1
-                    cells[ci].text = t["stat"]
-                    for run in cells[ci].paragraphs[0].runs:
-                        _set_run_font(run, size=9)
-                    ci += 1
-                    cells[ci].text = fmt_p(t["p"])
-                    for p in cells[ci].paragraphs:
-                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        for run in p.runs:
-                            _set_run_font(run, size=9, bold=(t["p"] < alpha))
-                else:
-                    cells[ci].text = ""; ci += 1
-                    cells[ci].text = ""; ci += 1
-                    cells[ci].text = ""
-
-        if next_is_new_block:
-            for c in cells:
-                _set_cell_border(c, bottom={'sz': 8, 'val': 'single'})
-
-    for c in table.rows[-1].cells:
-        _set_cell_border(c, bottom={'sz': 12, 'val': 'single'})
-
-    for row in table.rows:
-        for cell in row.cells:
-            for p in cell.paragraphs:
                 for run in p.runs:
-                    if run.font.size is None:
-                        _set_run_font(run, size=9)
+                    run.font.size = Pt(8)
+                    if c in P_COLS and is_sig(row[c], alpha):
+                        run.bold = True
 
-    footnotes = [descriptive_footnote(display_mode, alpha)]
-    pct_note = pct_basis_footnote(group_col, pct_mode)
-    if pct_note:
-        footnotes.append(pct_note)
-    if "catpct" in flags:
-        footnotes.append("Percentages for categorical variables are calculated among non-missing "
-                          "responses for that variable (missing values excluded from the denominator).")
-    if "chi2" in flags:
-        chi2_note = "Chi-square test of independence used for categorical comparisons with adequate expected cell counts"
-        chi2_note += " (Yates' continuity correction applied to 2\u00D72 tables)." if yates_correction \
-            else " (no continuity correction applied)."
-        footnotes.append(chi2_note)
-    if "fisher" in flags:
-        footnotes.append("Fisher's exact test used in place of chi-square when a 2\u00D72 table had an expected cell count below 5.")
-    if "lowE" in flags:
-        footnotes.append("Caution: one or more categorical comparisons above have expected cell counts below 5; chi-square approximation may be unreliable.")
-    if "skipped" in flags:
-        footnotes.append("A statistical test could not be computed for one or more variables and was left blank.")
-    footnotes.append(f"Bold p-values indicate statistical significance at \u03B1={alpha}.")
 
-    doc.add_paragraph()  # spacer
+def build_docx(results, alpha, footnotes):
+    doc = Document()
+    sec = doc.sections[0]
+    sec.orientation = WD_ORIENT.LANDSCAPE
+    sec.page_width, sec.page_height = sec.page_height, sec.page_width
+    for g, r in results.items():
+        doc.add_heading(f"Comparison by {g}", level=2)
+        doc.add_paragraph("Summary").runs[0].bold = True
+        _docx_table(doc, r["summary"], alpha)
+        if not r["posthoc"].empty:
+            doc.add_paragraph()
+            doc.add_paragraph("Post-hoc pairwise comparisons").runs[0].bold = True
+            _docx_table(doc, r["posthoc"], alpha)
+        doc.add_paragraph()
+        doc.add_paragraph("Assumption checks").runs[0].bold = True
+        _docx_table(doc, r["assumptions"], alpha)
+    doc.add_paragraph()
     for f in footnotes:
         p = doc.add_paragraph(f)
         for run in p.runs:
-            _set_run_font(run, size=9, italic=True)
-
+            run.italic = True
+            run.font.size = Pt(8)
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
@@ -611,229 +469,206 @@ def build_docx(header, display_rows, group_col, alpha, flags, display_mode="auto
 # Streamlit UI
 # --------------------------------------------------------------------------
 
-st.title("Stream-lite · Baseline Table Builder")
+st.title("Stream-lite · ANOVA Builder")
 st.caption(
-    "Upload a master chart. Assign variable types, choose a grouping variable, and "
-    "Stream-lite auto-selects the correct test — t-test or Wilcoxon for numeric variables, "
-    "chi-square or Fisher's exact for categorical — and lays out a three-line publication table."
+    "Upload a master chart, pick the outcome(s) and grouping variable(s), and get descriptive "
+    "statistics, parametric or non-parametric one-way ANOVA, and post-hoc pairwise comparisons "
+    "with confidence intervals, test statistics and p-values."
 )
 
 st.markdown("### 1. Upload master chart")
 uploaded = st.file_uploader("Excel (.xlsx/.xls) or CSV. First row must be column headers.",
-                             type=["xlsx", "xls", "csv"])
+                            type=["xlsx", "xls", "csv"])
 
-if uploaded is not None:
-    is_excel = not uploaded.name.lower().endswith(".csv")
-    sheet_name = None
+if uploaded is None:
+    st.info("Upload a file to get started. Nothing leaves your machine \u2014 the app runs locally.")
+    st.stop()
 
-    try:
-        if is_excel:
-            xls = pd.ExcelFile(uploaded)
-            sheet_names = xls.sheet_names
-            if len(sheet_names) > 1:
-                sheet_name = st.selectbox("Select sheet", options=sheet_names)
-            else:
-                sheet_name = sheet_names[0]
-            df = pd.read_excel(xls, sheet_name=sheet_name)
-        else:
-            df = pd.read_csv(uploaded)
-    except Exception as e:
-        st.error(f"Could not read that file: {e}")
+sheet_name = None
+try:
+    if not uploaded.name.lower().endswith(".csv"):
+        xls = pd.ExcelFile(uploaded)
+        sheet_names = xls.sheet_names
+        sheet_name = st.selectbox("Select sheet", options=sheet_names) if len(sheet_names) > 1 else sheet_names[0]
+        df = pd.read_excel(xls, sheet_name=sheet_name)
+    else:
+        df = pd.read_csv(uploaded)
+except Exception as e:
+    st.error(f"Could not read that file: {e}")
+    st.stop()
+
+df.columns = [str(c) for c in df.columns]
+st.success(f"Loaded **{uploaded.name}**" + (f" \u00B7 sheet **{sheet_name}**" if sheet_name else "")
+           + f" \u2014 {len(df)} rows, {len(df.columns)} columns")
+
+# ---- 2. variable types ----------------------------------------------------
+st.markdown("### 2. Variable types")
+st.caption("The app guesses numerical vs. categorical. Change **Type** where the guess is wrong "
+           "(e.g. a group coded 1/2/3 should be *categorical*).")
+
+dataset_key = f"{uploaded.name}::{sheet_name}"
+if st.session_state.get("_anova_file") != dataset_key:
+    meta = {}
+    for col in df.columns:
+        vtype, n, uniq = detect_type(df[col])
+        meta[col] = {"type": "auto", "detected": vtype, "n": n, "missing": len(df) - n, "unique": uniq}
+    st.session_state["anova_meta"] = meta
+    st.session_state["_anova_file"] = dataset_key
+    st.session_state.pop("anova_result", None)
+meta = st.session_state["anova_meta"]
+
+editor_df = pd.DataFrame([{
+    "Variable": c, "Type": meta[c]["type"], "Auto-detected": meta[c]["detected"].capitalize(),
+    "n (non-missing)": meta[c]["n"], "n (missing)": meta[c]["missing"], "Unique values": meta[c]["unique"],
+} for c in df.columns])
+
+edited = st.data_editor(
+    editor_df,
+    column_config={
+        "Type": st.column_config.SelectboxColumn(options=["auto", "numerical", "categorical"], required=True),
+        "Variable": st.column_config.TextColumn(disabled=True),
+        "Auto-detected": st.column_config.TextColumn(disabled=True),
+        "n (non-missing)": st.column_config.NumberColumn(disabled=True),
+        "n (missing)": st.column_config.NumberColumn(disabled=True),
+        "Unique values": st.column_config.NumberColumn(disabled=True),
+    },
+    hide_index=True, use_container_width=True, key="anova_var_editor",
+)
+for _, row in edited.iterrows():
+    meta[row["Variable"]]["type"] = row["Type"]
+
+numeric_cols = [c for c in df.columns if effective_type(meta[c]) == "numerical"]
+categorical_cols = [c for c in df.columns if effective_type(meta[c]) == "categorical"]
+
+# ---- 3. variables & options -------------------------------------------------
+st.markdown("### 3. Outcome(s), grouping variable(s) and tests")
+c1, c2 = st.columns(2)
+with c1:
+    outcomes = st.multiselect("Outcome variable(s) (numerical)", options=numeric_cols)
+with c2:
+    group_cols = st.multiselect("Grouping variable(s) (categorical)", options=categorical_cols,
+                                help="Each grouping variable gets its own one-way analysis.")
+
+o1, o2, o3, o4 = st.columns([1.6, 1.6, 1.6, 1])
+with o1:
+    test_mode = st.radio("Test selection", ["auto", "parametric", "nonparametric"],
+                         format_func=lambda x: {"auto": "Auto (normality-based)",
+                                                "parametric": "Parametric (ANOVA)",
+                                                "nonparametric": "Non-parametric (Kruskal\u2013Wallis)"}[x])
+    display = st.radio("Descriptive statistics", ["auto", "mean_sd", "median_iqr", "both"],
+                       format_func=lambda x: {"auto": "Auto (normality-based)", "mean_sd": "Mean \u00B1 SD",
+                                              "median_iqr": "Median (IQR)", "both": "Both"}[x])
+with o2:
+    variance = st.selectbox("ANOVA variant (parametric)", ["auto", "classic", "welch"],
+                            format_func=lambda x: {"auto": "Auto (Levene decides)", "classic": "Classic (equal variances)",
+                                                   "welch": "Welch (unequal variances)"}[x])
+    posthoc_param = st.selectbox("Post hoc \u2014 parametric", ["auto", "tukey", "gameshowell", "bonferroni"],
+                                 format_func=lambda x: {"auto": "Auto (Tukey, or Games-Howell if Welch)",
+                                                        "tukey": "Tukey HSD", "gameshowell": "Games-Howell",
+                                                        "bonferroni": "Bonferroni t-tests"}[x])
+with o3:
+    posthoc_np = st.selectbox("Post hoc \u2014 non-parametric (Mann-Whitney p adjustment)",
+                              ["holm", "bonferroni", "bh", "none"],
+                              format_func=lambda x: {"holm": "Holm", "bonferroni": "Bonferroni",
+                                                     "bh": "Benjamini-Hochberg (FDR)", "none": "None"}[x])
+    posthoc_only_sig = st.checkbox("Post hoc only when overall test is significant", value=False)
+with o4:
+    alpha = st.number_input("Significance level (\u03B1)", 0.001, 0.5, 0.05, 0.01)
+    decimals = st.number_input("Decimal places", 0, 6, 2, 1)
+
+ready = True
+if not outcomes:
+    st.warning("Select at least one outcome variable.")
+    ready = False
+if not group_cols:
+    st.warning("Select at least one grouping variable.")
+    ready = False
+overlap = set(outcomes) & set(group_cols)
+if overlap:
+    st.error(f"A variable cannot be both outcome and grouping: {', '.join(overlap)}")
+    ready = False
+
+if ready:
+    for g in group_cols:
+        levels = df[g].dropna().astype(str).str.strip()
+        counts = levels.value_counts().sort_index()
+        st.info(f"Groups in **{g}**: " + ", ".join(f"{k} (n={v})" for k, v in counts.items()))
+
+if st.button("Run analysis", type="primary", disabled=not ready):
+    cfg = {"alpha": alpha, "decimals": int(decimals), "test_mode": test_mode, "display": display,
+           "variance": variance, "posthoc_param": posthoc_param, "posthoc_np": posthoc_np,
+           "posthoc_only_sig": posthoc_only_sig}
+    results, messages, flags = {}, [], set()
+    for g in group_cols:
+        all_levels = sorted(df[g].dropna().astype(str).str.strip().unique())
+        all_levels = [x for x in all_levels if x not in ("", "nan")]
+        s_rows, a_rows, p_rows = [], [], []
+        for o in outcomes:
+            res, note = analyze(df, o, g, cfg)
+            if res is None:
+                messages.append(note)
+                continue
+            messages.extend(note)
+            row = {"Outcome": res["label"]}
+            for lv in all_levels:
+                row[lv] = res["cells"].get(lv, "—")
+            row.update({"Test": res["test"]["name"], "Statistic": res["test"]["stat"],
+                        "p-value": fmt_p(res["test"]["p"]), "Effect size": res["test"]["effect"]})
+            s_rows.append(row)
+            a_rows.extend(res["assumptions"])
+            for r in res["posthoc"]:
+                p_rows.append({k: r[k] for k in ["Outcome", "Comparison", "Method", "Difference", "CI",
+                                                  "Statistic", "p (raw)", "p (adj.)"]})
+            flags.add("param" if res["use_param"] else "nonparam")
+        if s_rows:
+            ci = f"{100 * (1 - alpha):g}% CI"
+            post_df = pd.DataFrame(p_rows).rename(columns={"CI": ci}) if p_rows else pd.DataFrame()
+            results[g] = {"summary": pd.DataFrame(s_rows), "assumptions": pd.DataFrame(a_rows), "posthoc": post_df}
+    st.session_state["anova_result"] = (results, messages, flags, cfg)
+
+if "anova_result" in st.session_state:
+    results, messages, flags, cfg = st.session_state["anova_result"]
+    alpha_r = cfg["alpha"]
+
+    for m in messages:
+        st.warning(m)
+    if not results:
         st.stop()
 
-    st.success(f"Loaded **{uploaded.name}**"
-                + (f" · sheet **{sheet_name}**" if sheet_name else "")
-                + f" — {len(df)} rows, {len(df.columns)} columns")
+    for g, r in results.items():
+        st.markdown(f"## Comparison by **{g}**")
+        st.markdown("#### Summary")
+        st.markdown(render_html(r["summary"], alpha_r), unsafe_allow_html=True)
 
-    st.markdown("### 2. Variable types")
-    st.caption(
-        "Stream-lite guesses numerical vs. categorical from the data, but no variable is "
-        "included automatically — check **Use** for each variable you want in the table, "
-        "and change **Type** if 'Auto' picked the wrong one."
-    )
-
-    dataset_key = f"{uploaded.name}::{sheet_name}"
-    if "var_meta" not in st.session_state or st.session_state.get("_last_file") != dataset_key:
-        var_meta = {}
-        total_rows = len(df)
-        for col in df.columns:
-            vtype, n, unique_n = detect_type(df[col])
-            var_meta[col] = {
-                "type": "auto",
-                "detected": vtype,
-                "use": False,
-                "n": n,
-                "missing": total_rows - n,
-                "unique": unique_n,
-            }
-        st.session_state["var_meta"] = var_meta
-        st.session_state["_last_file"] = dataset_key
-
-    var_meta = st.session_state["var_meta"]
-
-    editor_df = pd.DataFrame([
-        {
-            "Variable": col,
-            "Use": var_meta[col]["use"],
-            "Type": var_meta[col]["type"],
-            "Auto-detected": var_meta[col]["detected"].capitalize(),
-            "n (non-missing)": var_meta[col]["n"],
-            "n (missing)": var_meta[col]["missing"],
-            "Unique values": var_meta[col]["unique"],
-        }
-        for col in df.columns
-    ])
-
-    edited = st.data_editor(
-        editor_df,
-        column_config={
-            "Use": st.column_config.CheckboxColumn(required=True),
-            "Type": st.column_config.SelectboxColumn(options=["auto", "numerical", "categorical"], required=True),
-            "Auto-detected": st.column_config.TextColumn(disabled=True),
-            "Variable": st.column_config.TextColumn(disabled=True),
-            "n (non-missing)": st.column_config.NumberColumn(disabled=True),
-            "n (missing)": st.column_config.NumberColumn(disabled=True),
-            "Unique values": st.column_config.NumberColumn(disabled=True),
-        },
-        hide_index=True,
-        use_container_width=True,
-        key="var_editor",
-    )
-
-    for _, row in edited.iterrows():
-        var_meta[row["Variable"]]["use"] = bool(row["Use"])
-        var_meta[row["Variable"]]["type"] = row["Type"]
-
-    st.markdown("### 3. Grouping & test selection")
-    categorical_cols = [c for c in df.columns if effective_type(var_meta[c]) == "categorical"]
-
-    col1, col2, col3, col4 = st.columns([2, 2, 1, 1.3])
-    with col1:
-        group_col = st.selectbox(
-            "Grouping variable",
-            options=["— None (descriptive only) —"] + categorical_cols,
-        )
-        group_col = None if group_col == "— None (descriptive only) —" else group_col
-
-        display_mode = st.radio(
-            "Descriptive statistics display",
-            options=["auto", "mean_sd", "median_iqr", "both"],
-            format_func=lambda x: {"auto": "Auto (normality-based)",
-                                    "mean_sd": "Mean \u00B1 SD",
-                                    "median_iqr": "Median (IQR)",
-                                    "both": "Both"}[x],
-            horizontal=True,
-        )
-
-    with col2:
-        test_mode = st.radio(
-            "Numeric test selection",
-            options=["auto", "parametric", "nonparametric"],
-            format_func=lambda x: {"auto": "Auto (normality-based)",
-                                    "parametric": "Force parametric",
-                                    "nonparametric": "Force non-parametric"}[x],
-            horizontal=True,
-        )
-        st.caption("Display and test selection are independent — e.g. you can show both mean\u00B1SD "
-                    "and median (IQR) while still testing with Wilcoxon based on normality.")
-
-        yates_correction = st.checkbox(
-            "Apply Yates' continuity correction (2\u00D72 chi-square)",
-            value=False,
-            help="Only affects chi-square tests on 2\u00D72 tables (ignored for larger tables and for "
-                 "Fisher's exact test). Off by default — the uncorrected chi-square is generally "
-                 "preferred today; Yates' correction is conservative and can reduce power.",
-        )
-
-    with col3:
-        alpha = st.number_input("Significance level (\u03B1)", min_value=0.001, max_value=0.5,
-                                 value=0.05, step=0.01)
-
-    with col4:
-        pct_mode = st.radio(
-            "Categorical % basis",
-            options=["column", "row"],
-            format_func=lambda x: "Column-wise (\u00F7 group n)" if x == "column" else "Row-wise (\u00F7 category n)",
-            disabled=not group_col,
-            help="Column-wise: each n(%) is a share of its own group's total (columns sum to ~100%). "
-                 "Row-wise: each n(%) is a share of that category's total across all groups (rows sum "
-                 "to ~100%). Only applies when a grouping variable is selected.",
-        )
-        pct_digits = st.number_input("% decimal places", min_value=0, max_value=4, value=2, step=1)
-
-    n_selected = sum(1 for c in df.columns if var_meta[c]["use"] and c != group_col)
-
-    can_generate = True
-    if n_selected == 0:
-        st.warning("No variables selected — check **Use** for at least one variable in the table above.")
-        can_generate = False
-    if group_col:
-        levels = df[group_col].dropna().astype(str).str.strip().unique().tolist()
-        counts = ", ".join(
-            f"{lv} (n={(df[group_col].astype(str).str.strip() == lv).sum()})" for lv in sorted(levels)
-        )
-        if len(levels) < 2:
-            st.warning(f"Groups in **{group_col}**: {counts} — need at least 2 groups to run comparisons.")
-            can_generate = False
+        st.markdown("#### Post-hoc pairwise comparisons")
+        if r["posthoc"].empty:
+            st.caption("No post-hoc table: needs \u22653 groups (with 2 groups the omnibus test is the "
+                       "pairwise test) or the overall test was not significant while that filter is on.")
         else:
-            st.info(f"Groups in **{group_col}**: {counts}")
+            st.markdown(render_html(r["posthoc"], alpha_r), unsafe_allow_html=True)
 
-    if st.button("Generate Table 1", type="primary", disabled=not can_generate):
-        header, display_rows, csv_rows, flags = build_table1(
-            df, var_meta, group_col, test_mode, alpha, display_mode,
-            pct_mode=pct_mode, pct_digits=pct_digits, yates_correction=yates_correction,
-        )
-        st.session_state["result"] = (header, display_rows, csv_rows, flags, group_col, alpha,
-                                       display_mode, pct_mode, pct_digits, yates_correction)
+        with st.expander("Assumption checks (normality & equal variances)"):
+            st.markdown(render_html(r["assumptions"], alpha_r), unsafe_allow_html=True)
 
-    if "result" in st.session_state:
-        (header, display_rows, csv_rows, flags, result_group_col, result_alpha,
-         result_display_mode, result_pct_mode, result_pct_digits,
-         result_yates_correction) = st.session_state["result"]
+    footnotes = [
+        "Values are mean \u00B1 SD or median (IQR) as indicated in the Outcome column.",
+        f"Bold p-values indicate statistical significance at \u03B1={alpha_r}.",
+        "Normality assessed per group with Shapiro-Wilk; equal variances with Levene's test (median-centred).",
+    ]
+    if "param" in flags:
+        footnotes.append("Parametric: one-way ANOVA (Welch's ANOVA if variances unequal). Post-hoc differences "
+                         "are mean differences (first group \u2212 second group); Tukey/Games-Howell p-values and "
+                         "CIs are familywise-adjusted; Bonferroni CIs use \u03B1/m.")
+    if "nonparam" in flags:
+        footnotes.append("Non-parametric: Kruskal\u2013Wallis H with effect size \u03B5\u00B2=H/(N\u22121). Post hoc: pairwise "
+                         "Mann-Whitney U; difference is the Hodges-Lehmann median difference (first \u2212 second) with a "
+                         "distribution-free CI (widened to \u03B1/m under Holm/Bonferroni).")
+    st.caption("  \n".join(footnotes))
 
-        st.markdown("### Table 1. Baseline characteristics")
-        st.markdown(render_table_markdown(header, display_rows, result_group_col, result_alpha),
-                     unsafe_allow_html=True)
-
-        footnotes = [descriptive_footnote(result_display_mode, result_alpha)]
-        pct_note = pct_basis_footnote(result_group_col, result_pct_mode)
-        if pct_note:
-            footnotes.append(pct_note)
-        if "catpct" in flags:
-            footnotes.append("Percentages for categorical variables are calculated among non-missing "
-                              "responses for that variable (missing values excluded from the denominator).")
-        if "chi2" in flags:
-            chi2_note = "Chi-square test of independence used for categorical comparisons with adequate expected cell counts"
-            chi2_note += " (Yates' continuity correction applied to 2\u00D72 tables)." if result_yates_correction \
-                else " (no continuity correction applied)."
-            footnotes.append(chi2_note)
-        if "fisher" in flags:
-            footnotes.append("Fisher's exact test used in place of chi-square when a 2\u00D72 table had an expected cell count below 5.")
-        if "lowE" in flags:
-            footnotes.append("Caution: one or more categorical comparisons above have expected cell counts below 5; chi-square approximation may be unreliable.")
-        if "skipped" in flags:
-            footnotes.append("Note: a statistical test could not be computed for one or more variables (e.g. insufficient data in a group) and was left blank.")
-        footnotes.append(f"Bold p-values indicate statistical significance at \u03B1={result_alpha}.")
-        st.caption("  \n".join(footnotes))
-
-        dl_col1, dl_col2, dl_col3 = st.columns(3)
-
-        with dl_col1:
-            csv_buf = io.StringIO()
-            pd.DataFrame(csv_rows).to_csv(csv_buf, index=False, header=False)
-            st.download_button("Download CSV", csv_buf.getvalue(), file_name="table1.csv", mime="text/csv")
-
-        with dl_col2:
-            excel_bytes = build_excel(csv_rows, sheet_name="Table 1")
-            st.download_button("Download Excel", excel_bytes, file_name="table1.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-        with dl_col3:
-            docx_bytes = build_docx(header, display_rows, result_group_col, result_alpha, flags,
-                                     result_display_mode, pct_mode=result_pct_mode,
-                                     yates_correction=result_yates_correction)
-            st.download_button("Download Word", docx_bytes, file_name="table1.docx",
-                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-
-else:
-    st.info("Upload a file to get started. Nothing leaves your machine — the app runs locally.")
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button("Download Excel", build_excel(results), file_name="anova_results.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with d2:
+        st.download_button("Download Word", build_docx(results, alpha_r, footnotes), file_name="anova_results.docx",
+                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
