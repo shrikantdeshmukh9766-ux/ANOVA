@@ -28,11 +28,13 @@ Auto            -> parametric if every group passes Shapiro-Wilk (p > alpha),
 import html as _html
 import io
 import itertools
+import json
 import re
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from scipy import stats
 from scipy.stats import studentized_range
 from docx import Document
@@ -403,6 +405,34 @@ def render_html(df, alpha):
     return f"{css}<table class='sl-t'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
 
+def copy_button(df, label="Copy table"):
+    """Button that copies df to the clipboard as tab-separated text (with header),
+    which pastes straight into Excel cells."""
+    tsv = df.astype(str).to_csv(sep="\t", index=False)
+    payload = json.dumps(tsv)
+    components.html(f"""
+    <button id="b" style="padding:5px 12px;border:1px solid #888;border-radius:6px;
+      background:transparent;color:inherit;cursor:pointer;font-size:13px;font-family:sans-serif">
+      \U0001F4CB {label}</button>
+    <script>
+    const text = {payload};
+    const btn = document.getElementById('b');
+    const done = ok => {{ const o = btn.innerHTML; btn.innerHTML = ok ? '\u2705 Copied!' : '\u274C Copy failed';
+                         setTimeout(() => btn.innerHTML = o, 1500); }};
+    function fallback() {{
+      const t = document.createElement('textarea'); t.value = text;
+      document.body.appendChild(t); t.select();
+      let ok = false; try {{ ok = document.execCommand('copy'); }} catch (e) {{}}
+      document.body.removeChild(t); done(ok);
+    }}
+    btn.onclick = () => {{
+      if (navigator.clipboard && window.isSecureContext) {{
+        navigator.clipboard.writeText(text).then(() => done(true), fallback);
+      }} else fallback();
+    }};
+    </script>""", height=42)
+
+
 def build_excel(results):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
@@ -639,6 +669,7 @@ if "anova_result" in st.session_state:
         st.markdown(f"## Comparison by **{g}**")
         st.markdown("#### Summary")
         st.markdown(render_html(r["summary"], alpha_r), unsafe_allow_html=True)
+        copy_button(r["summary"], "Copy summary table")
 
         st.markdown("#### Post-hoc pairwise comparisons")
         if r["posthoc"].empty:
@@ -646,9 +677,11 @@ if "anova_result" in st.session_state:
                        "pairwise test) or the overall test was not significant while that filter is on.")
         else:
             st.markdown(render_html(r["posthoc"], alpha_r), unsafe_allow_html=True)
+            copy_button(r["posthoc"], "Copy post-hoc table")
 
         with st.expander("Assumption checks (normality & equal variances)"):
             st.markdown(render_html(r["assumptions"], alpha_r), unsafe_allow_html=True)
+            copy_button(r["assumptions"], "Copy assumption checks")
 
     footnotes = [
         "Values are mean \u00B1 SD or median (IQR) as indicated in the Outcome column.",
