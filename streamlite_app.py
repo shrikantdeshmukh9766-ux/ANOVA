@@ -8,7 +8,8 @@ variables, and get:
   1. Assumption checks   - Shapiro-Wilk normality per group + Levene (Brown-Forsythe)
   2. Summary table       - mean ± SD, median (IQR) or both (or chosen from normality),
                            with test name, test statistic, p-value and effect size
-  3. Post-hoc pairwise   - difference, CI, test statistic and p-value for every pair
+  3. ANOVA table         - Source, SS, df, MS, F/H and p-value for every outcome
+  4. Post-hoc pairwise   - difference, CI, test statistic and p-value for every pair
 
 Run with:
     pip install streamlit pandas numpy scipy openpyxl python-docx
@@ -80,6 +81,12 @@ def fmt_num(x, d=2):
     return f"{x:.{d}f}"
 
 
+def fmt_df(x):
+    if x is None:
+        return "—"
+    return f"{x:.0f}" if float(x).is_integer() else f"{x:.1f}"
+
+
 def is_sig(s, alpha):
     s = str(s)
     if s.startswith("<"):
@@ -147,11 +154,25 @@ def eta_squared(groups):
     return float(ssb / sst) if sst > 0 else np.nan
 
 
+def _tbl(source, ss=None, df=None, ms=None, stat=None, p=None):
+    return {"Source": source, "ss": ss, "df": df, "ms": ms, "stat": stat, "p": p}
+
+
 def classic_anova(groups):
     res = stats.f_oneway(*groups)
     k, N = len(groups), sum(len(g) for g in groups)
+    allv = np.concatenate(groups)
+    gm = allv.mean()
+    ssb = sum(len(g) * (g.mean() - gm) ** 2 for g in groups)
+    ssw = sum(((g - g.mean()) ** 2).sum() for g in groups)
+    dfb, dfw = k - 1, N - k
+    table = [
+        _tbl("Between groups", ssb, dfb, ssb / dfb, float(res.statistic), float(res.pvalue)),
+        _tbl("Within groups", ssw, dfw, ssw / dfw),
+        _tbl("Total", ssb + ssw, N - 1),
+    ]
     return {"name": "One-way ANOVA", "stat": f"F={res.statistic:.2f}, df={k-1},{N-k}",
-            "p": float(res.pvalue), "effect": f"\u03B7\u00B2={eta_squared(groups):.3f}"}
+            "p": float(res.pvalue), "effect": f"\u03B7\u00B2={eta_squared(groups):.3f}", "table": table}
 
 
 def welch_anova(groups):
@@ -168,16 +189,20 @@ def welch_anova(groups):
     F = a / b
     df2 = (k ** 2 - 1) / (3 * t)
     p = float(stats.f.sf(F, k - 1, df2))
+    table = [_tbl("Between groups", None, k - 1, None, float(F), p),
+             _tbl("Within groups", None, float(df2))]
     return {"name": "Welch's ANOVA", "stat": f"F={F:.2f}, df={k-1},{df2:.1f}",
-            "p": p, "effect": f"\u03B7\u00B2={eta_squared(groups):.3f}"}
+            "p": p, "effect": f"\u03B7\u00B2={eta_squared(groups):.3f}", "table": table}
 
 
 def kruskal(groups):
     res = stats.kruskal(*groups)
     N = sum(len(g) for g in groups)
     eps = res.statistic / (N - 1) if N > 1 else np.nan
+    table = [_tbl("Between groups", None, len(groups) - 1, None, float(res.statistic), float(res.pvalue)),
+             _tbl("Total", None, N - 1)]
     return {"name": "Kruskal\u2013Wallis H", "stat": f"H={res.statistic:.2f}, df={len(groups)-1}",
-            "p": float(res.pvalue), "effect": f"\u03B5\u00B2={eps:.3f}"}
+            "p": float(res.pvalue), "effect": f"\u03B5\u00B2={eps:.3f}", "table": table}
 
 
 # --------------------------------------------------------------------------
@@ -310,7 +335,7 @@ def outcome_label(col, mode, use_param):
 
 
 def analyze(df, outcome, gcol, cfg):
-    """Returns dict(summary_cells, test, assumptions, posthoc, use_param, msg) or None + message."""
+    """Returns dict(summary_cells, test, assumptions, posthoc, anova, use_param, msg) or None + message."""
     alpha, d = cfg["alpha"], cfg["decimals"]
     groups, dropped = get_groups(df, outcome, gcol)
     if len(groups) < 2:
@@ -375,12 +400,24 @@ def analyze(df, outcome, gcol, cfg):
         for r in posthoc:
             r["Outcome"] = outcome
 
+    # ANOVA table rows
+    stat_col = "H" if test["name"].startswith("Kruskal") else "F"
+    anova_rows = []
+    for r in test["table"]:
+        anova_rows.append({
+            "Outcome": outcome, "Test": test["name"], "Source": r["Source"],
+            "SS": fmt_num(r["ss"], d), "df": fmt_df(r["df"]), "MS": fmt_num(r["ms"], d),
+            "F / H": "—" if r["stat"] is None else f"{stat_col}={fmt_num(r['stat'], d)}",
+            "p-value": fmt_p(r["p"]),
+        })
+
     cells = {nm: summary_cell(a, cfg["display"], use_param, d) for nm, a in zip(names, arrs)}
     notes = []
     if dropped:
         notes.append(f"{outcome} by {gcol}: groups with n<2 excluded ({', '.join(dropped)}).")
     return {"cells": cells, "test": test, "assumptions": assumptions, "posthoc": posthoc,
-            "use_param": use_param, "k": k, "label": outcome_label(outcome, cfg["display"], use_param)}, notes
+            "anova": anova_rows, "use_param": use_param, "k": k,
+            "label": outcome_label(outcome, cfg["display"], use_param)}, notes
 
 
 # --------------------------------------------------------------------------
@@ -439,6 +476,7 @@ def build_excel(results):
         for i, (g, r) in enumerate(results.items(), 1):
             tag = re.sub(r"[\[\]:*?/\\]", "_", g)[:22]
             r["summary"].to_excel(xw, sheet_name=f"S{i}_{tag}"[:31], index=False)
+            r["anova"].to_excel(xw, sheet_name=f"T{i}_{tag}"[:31], index=False)
             r["assumptions"].to_excel(xw, sheet_name=f"A{i}_{tag}"[:31], index=False)
             if not r["posthoc"].empty:
                 r["posthoc"].to_excel(xw, sheet_name=f"P{i}_{tag}"[:31], index=False)
@@ -476,6 +514,9 @@ def build_docx(results, alpha, footnotes):
         doc.add_heading(f"Comparison by {g}", level=2)
         doc.add_paragraph("Summary").runs[0].bold = True
         _docx_table(doc, r["summary"], alpha)
+        doc.add_paragraph()
+        doc.add_paragraph("ANOVA table").runs[0].bold = True
+        _docx_table(doc, r["anova"], alpha)
         if not r["posthoc"].empty:
             doc.add_paragraph()
             doc.add_paragraph("Post-hoc pairwise comparisons").runs[0].bold = True
@@ -502,8 +543,8 @@ def build_docx(results, alpha, footnotes):
 st.title("Stream-lite · ANOVA Builder")
 st.caption(
     "Upload a master chart, pick the outcome(s) and grouping variable(s), and get descriptive "
-    "statistics, parametric or non-parametric one-way ANOVA, and post-hoc pairwise comparisons "
-    "with confidence intervals, test statistics and p-values."
+    "statistics, parametric or non-parametric one-way ANOVA, an ANOVA table, and post-hoc pairwise "
+    "comparisons with confidence intervals, test statistics and p-values."
 )
 
 st.markdown("### 1. Upload master chart")
@@ -632,7 +673,7 @@ if st.button("Run analysis", type="primary", disabled=not ready):
     for g in group_cols:
         all_levels = sorted(df[g].dropna().astype(str).str.strip().unique())
         all_levels = [x for x in all_levels if x not in ("", "nan")]
-        s_rows, a_rows, p_rows = [], [], []
+        s_rows, a_rows, p_rows, t_rows = [], [], [], []
         for o in outcomes:
             res, note = analyze(df, o, g, cfg)
             if res is None:
@@ -646,6 +687,7 @@ if st.button("Run analysis", type="primary", disabled=not ready):
                         "p-value": fmt_p(res["test"]["p"]), "Effect size": res["test"]["effect"]})
             s_rows.append(row)
             a_rows.extend(res["assumptions"])
+            t_rows.extend(res["anova"])
             for r in res["posthoc"]:
                 p_rows.append({k: r[k] for k in ["Outcome", "Comparison", "Method", "Difference", "CI",
                                                   "Statistic", "p (raw)", "p (adj.)"]})
@@ -653,7 +695,8 @@ if st.button("Run analysis", type="primary", disabled=not ready):
         if s_rows:
             ci = f"{100 * (1 - alpha):g}% CI"
             post_df = pd.DataFrame(p_rows).rename(columns={"CI": ci}) if p_rows else pd.DataFrame()
-            results[g] = {"summary": pd.DataFrame(s_rows), "assumptions": pd.DataFrame(a_rows), "posthoc": post_df}
+            results[g] = {"summary": pd.DataFrame(s_rows), "anova": pd.DataFrame(t_rows),
+                          "assumptions": pd.DataFrame(a_rows), "posthoc": post_df}
     st.session_state["anova_result"] = (results, messages, flags, cfg)
 
 if "anova_result" in st.session_state:
@@ -671,6 +714,10 @@ if "anova_result" in st.session_state:
         st.markdown(render_html(r["summary"], alpha_r), unsafe_allow_html=True)
         copy_button(r["summary"], "Copy summary table")
 
+        st.markdown("#### ANOVA table")
+        st.markdown(render_html(r["anova"], alpha_r), unsafe_allow_html=True)
+        copy_button(r["anova"], "Copy ANOVA table")
+
         st.markdown("#### Post-hoc pairwise comparisons")
         if r["posthoc"].empty:
             st.caption("No post-hoc table: needs \u22653 groups (with 2 groups the omnibus test is the "
@@ -687,6 +734,8 @@ if "anova_result" in st.session_state:
         "Values are mean \u00B1 SD or median (IQR) as indicated in the Outcome column.",
         f"Bold p-values indicate statistical significance at \u03B1={alpha_r}.",
         "Normality assessed per group with Shapiro-Wilk; equal variances with Levene's test (median-centred).",
+        "ANOVA table: SS = sum of squares, MS = mean square. Welch's ANOVA and Kruskal\u2013Wallis do not "
+        "have a standard SS/MS decomposition, so only df, test statistic and p are shown.",
     ]
     if "param" in flags:
         footnotes.append("Parametric: one-way ANOVA (Welch's ANOVA if variances unequal). Post-hoc differences "
